@@ -2,28 +2,31 @@ import streamlit as st
 import pandas as pd
 import io
 
-# Configuração da página - O Curador
-st.set_page_config(page_title="Curador - Painel de Apuração Fiscal", layout="wide")
+# Configuração da página
+st.set_page_config(page_title="Curador - Auditoria Fiscal Robusta", layout="wide")
 
 def clean_numeric_col(df, col_name):
-    """Limpeza técnica de colunas numéricas (decimais BR)."""
+    """Limpeza técnica de colunas numéricas."""
     if col_name in df.columns:
         s = df[col_name].astype(str).str.replace(r'\s+', '', regex=True)
         s = s.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
         df[col_name] = pd.to_numeric(s, errors='coerce').fillna(0.0)
     return df
 
-def auditoria_icms_ipi(row, tipo='saida'):
+def auditoria_robusta(row, tipo='saida'):
     """
-    Motor de Auditoria (ICMS, ST, IPI).
-    Retorna: Diagnóstico, Ação Domínio e Ação Cliente.
+    MOTOR DE DECISÃO:
+    Analisa o erro e define:
+    1. Diagnóstico Técnico
+    2. Ação Legal (Nota Complementar vs CC-e)
+    3. Ação Preventiva (Arrumar ERP)
+    4. Ação Contábil (Arrumar Domínio)
     """
+    # Dados Base
     cfop = str(row['CFOP']).strip().replace('.', '')
-    # CST ICMS (2 dígitos, ignora origem)
     cst_full = str(row['CST-ICMS'] if tipo == 'entrada' else row['CST']).strip()
     cst = cst_full[-2:] if len(cst_full) >= 2 else cst_full.zfill(2)
     
-    # Valores
     vlr_prod = row['VPROD'] if tipo == 'entrada' else row['VITEM']
     vlr_icms = row['VLR-ICMS'] if tipo == 'entrada' else row['ICMS']
     bc_icms = row['BC-ICMS'] if tipo == 'entrada' else row['BC_ICMS']
@@ -31,84 +34,119 @@ def auditoria_icms_ipi(row, tipo='saida'):
     vlr_st = row['ICMS-ST'] if tipo == 'entrada' else row['ICMSST']
     vlr_ipi = row['VLR_IPI'] if tipo == 'entrada' else row['IPI']
     
-    # Acessórios
     frete = row['FRETE']
     desc = row['DESC']
-    
     uf_dest = "" if tipo == 'entrada' else str(row['Ufp']).strip().upper()
     
-    erros, cliente, dominio = [], [], []
+    # Listas de Controle
+    cst_st_mandatorio = ['10', '30', '70']
+    cst_st_permitido = ['10', '30', '70', '90']
+    cfop_st_gerador = ['5401', '5403', '6401', '6403', '5405', '6405']
+    cfop_industrial = ['5101', '6101']
+    
+    # Outputs
+    diag, acao_legal, acao_preventiva, acao_dominio = [], [], [], []
 
-    # 1. ICMS PRÓPRIO
+    # ==============================================================================
+    # 1. ANÁLISE DE ICMS PRÓPRIO
+    # ==============================================================================
+    
+    # CENÁRIO: CFOP 6403 sem destaque de ICMS Próprio
     if tipo == 'saida' and cfop == '6403' and vlr_icms == 0:
-        erros.append("FALTA ICMS PRÓPRIO (6403).")
-        cliente.append("Destacar ICMS Próprio.")
-        dominio.append("Habilitar ICMS Próprio em ST no Acumulador.")
+        diag.append("ERRO GRAVE: Omissão de ICMS Próprio em operação de Substituto (6403).")
+        acao_legal.append("EMITIR NOTA FISCAL COMPLEMENTAR DE ICMS (Imposto esquecido).")
+        acao_preventiva.append("Configurar ERP para destacar ICMS Próprio + ST.")
+        acao_dominio.append("Acumulador: Aba Impostos > Incluir ICMS > Aba Geral > Opção 'Faturamento de Substituto'.")
 
+    # CENÁRIO: Base de Cálculo menor que o devido (Frete não somado)
     if bc_icms > 0:
         base_teorica = vlr_prod + frete - desc
         if (base_teorica - bc_icms) > 1.0:
-            erros.append("BASE ICMS MENOR QUE PRODUTO+FRETE.")
-            dominio.append("Marcar 'Frete compõe base de ICMS' no acumulador.")
+            diff = base_teorica - bc_icms
+            diag.append(f"BASE REDUZIDA INDEVIDA: Base {bc_icms} < {base_teorica} (Frete não somado?).")
+            acao_legal.append("EMITIR NOTA COMPLEMENTAR DE ICMS (Diferença de Base).")
+            acao_preventiva.append("Marcar flag 'Frete compõe base ICMS' no sistema emissor.")
+            acao_dominio.append("Acumulador: Aba ICMS > Opção 'Frete compõe base de cálculo'.")
 
+    # CENÁRIO: Alíquota Interestadual Errada (Ex: Mandou 12% pro Nordeste)
     if tipo == 'saida' and cfop.startswith('6'):
         reg_7 = ['AC', 'AL', 'AM', 'AP', 'BA', 'CE', 'DF', 'ES', 'GO', 'MA', 'MS', 'MT', 'PA', 'PB', 'PE', 'PI', 'RN', 'RO', 'RR', 'SE', 'TO']
-        if uf_dest in reg_7 and aliq_icms not in [7.0, 4.0]:
-            erros.append(f"ALÍQUOTA {aliq_icms}% ERRADA (META 7%).")
-            cliente.append("Ajustar alíquota interestadual.")
+        if uf_dest in reg_7 and aliq_icms not in [7.0, 4.0] and aliq_icms > 0:
+            diag.append(f"ALÍQUOTA INCORRETA: Usado {aliq_icms}% para {uf_dest} (Correto: 7%).")
+            if aliq_icms < 7:
+                acao_legal.append("EMITIR NOTA COMPLEMENTAR (Diferença de Alíquota).")
+            else:
+                acao_legal.append("ANÁLISE: Imposto pago a maior. Ver possibilidade de estorno/crédito.")
+            acao_preventiva.append(f"Corrigir cadastro de alíquota interestadual para UF {uf_dest}.")
+            acao_dominio.append("Cadastro de Produto > Impostos > ICMS Estadual > Definir exceção por UF.")
 
-    # 2. ICMS ST
-    cst_st_mandatorio = ['10', '30', '70']
-    cst_st_permitido = ['10', '30', '70', '90']
-    cfop_st = ['5401', '5403', '6401', '6403', '5405', '6405']
+    # ==============================================================================
+    # 2. ANÁLISE DE ICMS ST
+    # ==============================================================================
 
+    # CENÁRIO: CST exige ST, mas valor é zero
     if cst in cst_st_mandatorio and vlr_st == 0:
-        erros.append(f"CST {cst} EXIGE ST (ZERADO).")
-        cliente.append("Informar ST.")
-        dominio.append("Marcar 'Gera guia ST'.")
-    
-    elif cst == '90' and vlr_st == 0 and cfop in cfop_st:
-        erros.append(f"CST 90 EM CFOP {cfop} EXIGE ST.")
-        cliente.append("Destacar ST.")
+        diag.append(f"OMISSÃO DE ST: CST {cst} obriga destaque, valor está zerado.")
+        acao_legal.append("EMITIR NOTA COMPLEMENTAR DE ICMS ST.")
+        acao_preventiva.append("Revisar MVA/IVA no cadastro do produto.")
+        acao_dominio.append("Acumulador: Aba Estadual > Selecionar 'Gera guia de recolhimento ST'.")
 
+    # CENÁRIO: CST 90 sem ST em operação que deveria ter
+    elif cst == '90' and vlr_st == 0 and cfop in cfop_st_gerador:
+        diag.append("OMISSÃO DE ST (CST 90): Operação de substituição sem retenção.")
+        acao_legal.append("EMITIR NOTA COMPLEMENTAR DE ICMS ST.")
+        acao_preventiva.append("Configurar regra de ST para este CFOP/CST.")
+        acao_dominio.append("Acumulador: Verificar se imposto 01-ICMS tem subtributária.")
+
+    # CENÁRIO: Destaque indevido (CST errado)
     elif vlr_st > 0 and cst not in cst_st_permitido and cst != '60':
-        erros.append(f"ST INDEVIDO P/ CST {cst}.")
-        cliente.append("Zerar ST.")
+        diag.append(f"ERRO FORMAL/FINANCEIRO: ST destacada em CST {cst} (Não permitido).")
+        acao_legal.append("Se cobrado do cliente: Devolução/Refaturamento. Se erro só de CST: CARTA DE CORREÇÃO (CC-e).")
+        acao_preventiva.append("Alterar CST do produto para 10 ou 60.")
+        acao_dominio.append("Utilitários > Alterar CST de ICMS em lote.")
 
-    # 3. IPI
-    if cfop in ['5101', '6101'] and vlr_ipi == 0:
-        erros.append("VENDA INDUSTRIAL SEM IPI.")
-        dominio.append("Configurar IPI (Imposto 2).")
-    
+    # ==============================================================================
+    # 3. ANÁLISE DE IPI
+    # ==============================================================================
+
+    # CENÁRIO: Indústria sem destacar IPI
+    if cfop in cfop_industrial and vlr_ipi == 0:
+        diag.append("OMISSÃO DE IPI: Venda industrial sem imposto federal.")
+        acao_legal.append("EMITIR NOTA COMPLEMENTAR DE IPI.")
+        acao_preventiva.append("Cadastrar alíquota de IPI na NCM do produto.")
+        acao_dominio.append("Acumulador: Incluir imposto IPI. Produto: Vincular classificação fiscal.")
+
+    # CENÁRIO: Compra Industrial sem Crédito (Entrada)
     if tipo == 'entrada' and cfop in ['1101', '2101'] and vlr_ipi == 0:
-        erros.append("COMPRA INDUSTRIAL SEM CRÉDITO IPI.")
-        dominio.append("Verificar apropriação de IPI.")
+        diag.append("PERDA DE CRÉDITO IPI: Insumo industrial sem aproveitamento.")
+        acao_legal.append("Verificar XML do fornecedor. Se destacado lá, lançar crédito manualmente.")
+        acao_dominio.append("Lançamento: Habilitar campo de IPI e verificar CST de entrada (50).")
 
     return pd.Series({
-        'DIAGNÓSTICO': " | ".join(erros) if erros else "Regular",
-        'AÇÃO_DOMINIO': " | ".join(dominio) if dominio else "-",
-        'AÇÃO_CLIENTE': " | ".join(cliente) if cliente else "-"
+        'DIAGNÓSTICO_TÉCNICO': " | ".join(diag) if diag else "Regular",
+        'AÇÃO_LEGAL_IMEDIATA': " | ".join(acao_legal) if acao_legal else "-",
+        'AÇÃO_SISTEMA_CLIENTE': " | ".join(acao_preventiva) if acao_preventiva else "-",
+        'AÇÃO_DOMINIO_SISTEMAS': " | ".join(acao_dominio) if dominio else "-"
     })
 
 def reordenar_colunas(df, tipo='saida'):
-    """Move colunas de auditoria para o início (visibilidade imediata)."""
+    """Traz as colunas de inteligência para o começo."""
     cols = list(df.columns)
-    cols_audit = ['DIAGNÓSTICO', 'AÇÃO_DOMINIO', 'AÇÃO_CLIENTE']
+    novas_cols = ['DIAGNÓSTICO_TÉCNICO', 'AÇÃO_LEGAL_IMEDIATA', 'AÇÃO_SISTEMA_CLIENTE', 'AÇÃO_DOMINIO_SISTEMAS']
     
-    # Remove da posição original
-    for c in cols_audit:
+    # Remove originais
+    for c in novas_cols:
         if c in cols: cols.remove(c)
             
-    # Insere logo após a NF (posições 1, 2, 3)
+    # Insere na posição 1 (logo após NF)
     pos = 1
-    for c in cols_audit:
+    for c in reversed(novas_cols):
         cols.insert(pos, c)
-        pos += 1
         
     return df[cols]
 
 def main():
-    st.title("⚖️ Curador: Painel de Apuração e Auditoria")
+    st.title("⚖️ Curador: Ferramenta Robusta de Auditoria e Compliance")
     st.markdown("---")
     
     c1, c2 = st.columns(2)
@@ -124,84 +162,68 @@ def main():
             df_ent = pd.read_csv(ent_f, sep=';', encoding='latin-1', header=None, names=cols_ent)
             df_sai = pd.read_csv(sai_f, sep=';', encoding='latin-1', header=None, names=cols_sai)
 
-            # Limpeza
+            # Limpeza Numérica
             for c in ['VLR-ICMS', 'VLR_IPI', 'BC-ICMS', 'VC', 'ICMS-ST', 'VPROD', 'FRETE', 'DESC']: df_ent = clean_numeric_col(df_ent, c)
             for c in ['ICMS', 'IPI', 'BC_ICMS', 'VC_ITEM', 'ALIQ_ICMS', 'ICMSST', 'VITEM', 'FRETE', 'DESC']: df_sai = clean_numeric_col(df_sai, c)
 
-            # Processamento
-            df_ent[['DIAGNÓSTICO', 'AÇÃO_DOMINIO', 'AÇÃO_CLIENTE']] = df_ent.apply(lambda r: auditoria_icms_ipi(r, 'entrada'), axis=1)
-            df_sai[['DIAGNÓSTICO', 'AÇÃO_DOMINIO', 'AÇÃO_CLIENTE']] = df_sai.apply(lambda r: auditoria_icms_ipi(r, 'saida'), axis=1)
+            # --- PROCESSAMENTO ROBUSTO ---
+            df_ent[['DIAGNÓSTICO_TÉCNICO', 'AÇÃO_LEGAL_IMEDIATA', 'AÇÃO_SISTEMA_CLIENTE', 'AÇÃO_DOMINIO_SISTEMAS']] = df_ent.apply(lambda r: auditoria_robusta(r, 'entrada'), axis=1)
+            df_sai[['DIAGNÓSTICO_TÉCNICO', 'AÇÃO_LEGAL_IMEDIATA', 'AÇÃO_SISTEMA_CLIENTE', 'AÇÃO_DOMINIO_SISTEMAS']] = df_sai.apply(lambda r: auditoria_robusta(r, 'saida'), axis=1)
 
-            # Reordenar para ver o erro primeiro
+            # Reordenação
             df_ent = reordenar_colunas(df_ent, 'entrada')
             df_sai = reordenar_colunas(df_sai, 'saida')
 
-            # --- CÁLCULO DO RESUMO (CRÉDITO vs DÉBITO) ---
-            resumo_dados = []
+            # --- CÁLCULO DE SALDOS ---
+            v_icms = df_sai['ICMS'].sum() - df_ent['VLR-ICMS'].sum()
+            v_st = df_sai['ICMSST'].sum() - df_ent['ICMS-ST'].sum()
+            v_ipi = df_sai['IPI'].sum() - df_ent['VLR_IPI'].sum()
+
+            st.success("Auditoria Completa Realizada!")
+
+            # --- PAINEL DE SALDOS ---
+            st.subheader("📊 Apuração dos Impostos")
+            resumo = pd.DataFrame([
+                {'Imposto': 'ICMS PRÓPRIO', 'Débito': df_sai['ICMS'].sum(), 'Crédito': df_ent['VLR-ICMS'].sum(), 'Saldo': v_icms, 'Status': 'A RECOLHER' if v_icms > 0 else 'CREDOR'},
+                {'Imposto': 'ICMS ST', 'Débito': df_sai['ICMSST'].sum(), 'Crédito': df_ent['ICMS-ST'].sum(), 'Saldo': v_st, 'Status': 'A RECOLHER' if v_st > 0 else 'CREDOR'},
+                {'Imposto': 'IPI', 'Débito': df_sai['IPI'].sum(), 'Crédito': df_ent['VLR_IPI'].sum(), 'Saldo': v_ipi, 'Status': 'A RECOLHER' if v_ipi > 0 else 'CREDOR'}
+            ])
+            st.table(resumo.style.format({'Débito': 'R$ {:,.2f}', 'Crédito': 'R$ {:,.2f}', 'Saldo': 'R$ {:,.2f}'}))
+
+            # --- PRÉVIAS DE INCONSISTÊNCIAS ---
+            st.subheader("🚨 Inconsistências Críticas (Com Ação Sugerida)")
             
-            # ICMS
-            cred_icms = df_ent['VLR-ICMS'].sum()
-            deb_icms = df_sai['ICMS'].sum()
-            saldo_icms = deb_icms - cred_icms
-            resumo_dados.append({'Imposto': 'ICMS PRÓPRIO', 'Débitos (Saídas)': deb_icms, 'Créditos (Entradas)': cred_icms, 'Saldo Final': saldo_icms, 'Situação': 'A RECOLHER' if saldo_icms > 0 else 'CREDOR'})
+            # Filtro apenas erros
+            erros_sai = df_sai[df_sai['DIAGNÓSTICO_TÉCNICO'] != "Regular"]
+            erros_ent = df_ent[df_ent['DIAGNÓSTICO_TÉCNICO'] != "Regular"]
 
-            # ST
-            cred_st = df_ent['ICMS-ST'].sum()
-            deb_st = df_sai['ICMSST'].sum()
-            saldo_st = deb_st - cred_st
-            resumo_dados.append({'Imposto': 'ICMS ST', 'Débitos (Saídas)': deb_st, 'Créditos (Entradas)': cred_st, 'Saldo Final': saldo_st, 'Situação': 'A RECOLHER' if saldo_st > 0 else 'CREDOR'})
-
-            # IPI
-            cred_ipi = df_ent['VLR_IPI'].sum()
-            deb_ipi = df_sai['IPI'].sum()
-            saldo_ipi = deb_ipi - cred_ipi
-            resumo_dados.append({'Imposto': 'IPI', 'Débitos (Saídas)': deb_ipi, 'Créditos (Entradas)': cred_ipi, 'Saldo Final': saldo_ipi, 'Situação': 'A RECOLHER' if saldo_ipi > 0 else 'CREDOR'})
-
-            df_resumo = pd.DataFrame(resumo_dados)
-
-            st.success("Processamento Concluído!")
-
-            # --- EXIBIÇÃO DO RESUMO NA TELA ---
-            st.subheader("📊 Resumo de Apuração (Débito x Crédito)")
-            
-            # Formatação visual do saldo
-            st.dataframe(df_resumo.style.format({
-                'Débitos (Saídas)': 'R$ {:,.2f}',
-                'Créditos (Entradas)': 'R$ {:,.2f}',
-                'Saldo Final': 'R$ {:,.2f}'
-            }), use_container_width=True)
-
-            # --- PRÉVIAS DE ERROS ---
-            st.markdown("---")
-            st.subheader("🔎 Inconsistências (Ação Necessária)")
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**Saídas com Erro**")
-                erros_sai = df_sai[df_sai['DIAGNÓSTICO'] != "Regular"]
-                if erros_sai.empty: st.info("Tudo certo nas saídas.")
-                else: st.dataframe(erros_sai, use_container_width=True)
+                st.markdown("**Saídas: Ações Necessárias**")
+                if erros_sai.empty: st.info("Nenhuma inconsistência.")
+                else: st.dataframe(erros_sai[['NF', 'CFOP', 'DIAGNÓSTICO_TÉCNICO', 'AÇÃO_LEGAL_IMEDIATA']], use_container_width=True)
+            
             with c2:
-                st.markdown("**Entradas com Erro**")
-                erros_ent = df_ent[df_ent['DIAGNÓSTICO'] != "Regular"]
-                if erros_ent.empty: st.info("Tudo certo nas entradas.")
-                else: st.dataframe(erros_ent, use_container_width=True)
+                st.markdown("**Entradas: Ações Necessárias**")
+                if erros_ent.empty: st.info("Nenhuma inconsistência.")
+                else: st.dataframe(erros_ent[['NUM_NF', 'CFOP', 'DIAGNÓSTICO_TÉCNICO', 'AÇÃO_DOMINIO_SISTEMAS']], use_container_width=True)
 
             # Exportação
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 df_ent.to_excel(writer, sheet_name='Entradas Auditadas', index=False)
                 df_sai.to_excel(writer, sheet_name='Saídas Auditadas', index=False)
-                df_resumo.to_excel(writer, sheet_name='Apuração Final', index=False)
+                resumo.to_excel(writer, sheet_name='Apuração Final', index=False)
                 
                 workbook = writer.book
                 fmt_red = workbook.add_format({'bg_color': '#FFC7CE'})
                 for sheet, df_ref in [('Entradas Auditadas', df_ent), ('Saídas Auditadas', df_sai)]:
                     ws = writer.sheets[sheet]
-                    ws.set_column('A:AG', 18) # Largura padrão
-                    for i, val in enumerate(df_ref['DIAGNÓSTICO']):
+                    ws.set_column('A:Z', 25) # Largura para ler as ações
+                    for i, val in enumerate(df_ref['DIAGNÓSTICO_TÉCNICO']):
                         if val != "Regular": ws.set_row(i + 1, None, fmt_red)
 
-            st.download_button("📥 Baixar Planilha do Curador", output.getvalue(), "Apuração_Curador.xlsx")
+            st.download_button("📥 Baixar Relatório Robusto", output.getvalue(), "Auditoria_Completa_Curador.xlsx")
 
         except Exception as e:
             st.error(f"Erro Crítico: {e}")

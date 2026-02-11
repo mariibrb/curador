@@ -5,6 +5,12 @@ import io
 # Configuração da página - O Curador
 st.set_page_config(page_title="Curador - Auditoria Fiscal Robusta", layout="wide")
 
+# --- FUNÇÃO DE RESET (NOVA) ---
+def reset_auditoria():
+    """Limpa os arquivos da memória para nova análise."""
+    st.session_state['arquivo_entrada'] = None
+    st.session_state['arquivo_saida'] = None
+
 # --- FUNÇÕES UTILITÁRIAS ---
 def clean_numeric_col(df, col_name):
     """Garante que números brasileiros (1.000,00) sejam lidos corretamente."""
@@ -136,13 +142,21 @@ def reordenar_audit(df):
     return df[cols]
 
 def main():
-    st.title("⚖️ Curador: Auditoria Fiscal Robusta (Compliance Total)")
+    # Cabeçalho com Botão de Reset
+    col_title, col_btn = st.columns([4, 1])
+    with col_title:
+        st.title("⚖️ Curador: Auditoria Fiscal Robusta")
+    with col_btn:
+        st.button("🔄 Nova Auditoria (Limpar)", on_click=reset_auditoria, type="primary")
+    
     st.markdown("---")
     
-    # 1. Upload Centralizado
+    # 1. Upload Centralizado (Com chaves de sessão para o Reset funcionar)
     c1, c2 = st.columns(2)
-    with c1: ent_f = st.file_uploader("📥 Entradas (CSV)", type=["csv"])
-    with c2: sai_f = st.file_uploader("📤 Saídas (CSV)", type=["csv"])
+    with c1: 
+        ent_f = st.file_uploader("📥 Entradas (CSV)", type=["csv"], key='arquivo_entrada')
+    with c2: 
+        sai_f = st.file_uploader("📤 Saídas (CSV)", type=["csv"], key='arquivo_saida')
 
     if ent_f and sai_f:
         try:

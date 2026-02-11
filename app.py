@@ -5,7 +5,7 @@ import io
 # Configuração da página - O Curador
 st.set_page_config(page_title="Curador - Auditoria Fiscal Robusta", layout="wide")
 
-# --- FUNÇÃO DE RESET (NOVA) ---
+# --- FUNÇÃO DE RESET ---
 def reset_auditoria():
     """Limpa os arquivos da memória para nova análise."""
     st.session_state['arquivo_entrada'] = None
@@ -19,6 +19,56 @@ def clean_numeric_col(df, col_name):
         s = s.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
         df[col_name] = pd.to_numeric(s, errors='coerce').fillna(0.0)
     return df
+
+def gerar_resumo_cfop(df, tipo='entrada'):
+    """
+    Gera um resumo estilo Livro de Apuração (Modelo P9), agrupando por CFOP.
+    Calcula Isentas e Outras baseado no CST e Diferença de Base.
+    """
+    dff = df.copy()
+    
+    if tipo == 'entrada':
+        col_vc = 'VC'
+        col_bc = 'BC-ICMS'
+        col_icms = 'VLR-ICMS'
+        col_st = 'ICMS-ST'
+        col_ipi = 'VLR_IPI'
+        col_cst = 'CST-ICMS'
+    else:
+        col_vc = 'VC_ITEM' # Usa valor do item para saídas
+        col_bc = 'BC_ICMS'
+        col_icms = 'ICMS'
+        col_st = 'ICMSST'
+        col_ipi = 'IPI'
+        col_cst = 'CST'
+
+    # Lógica de Isentas/Outras (Simplificada para Resumo)
+    # Se CST for Isento (40, 41) -> Vai para Isentas
+    # Se CST for Outros (50, 90) ou houver diferença de base -> Vai para Outras
+    def calcular_colunas_livro(row):
+        cst = str(row[col_cst])[-2:]
+        vc = row[col_vc]
+        bc = row[col_bc]
+        
+        isentas = 0.0
+        outras = 0.0
+        
+        # Diferença não tributada
+        diff = max(vc - bc, 0)
+        
+        if cst in ['40', '41', '30', '60']: # Isentas ou ST sem crédito/débito direto
+            isentas = diff
+        else:
+            outras = diff
+            
+        return pd.Series([isentas, outras])
+
+    dff[['Isentas', 'Outras']] = dff.apply(calcular_colunas_livro, axis=1)
+
+    # Agrupamento
+    resumo = dff.groupby('CFOP')[[col_vc, col_bc, col_icms, col_st, col_ipi, 'Isentas', 'Outras']].sum().reset_index()
+    resumo.columns = ['CFOP', 'Valor Contábil', 'Base Cálculo', 'ICMS', 'ICMS ST', 'IPI', 'Isentas', 'Outras']
+    return resumo
 
 def auditoria_decisiva(row, tipo='saida'):
     """
@@ -151,7 +201,7 @@ def main():
     
     st.markdown("---")
     
-    # 1. Upload Centralizado (Com chaves de sessão para o Reset funcionar)
+    # 1. Upload Centralizado
     c1, c2 = st.columns(2)
     with c1: 
         ent_f = st.file_uploader("📥 Entradas (CSV)", type=["csv"], key='arquivo_entrada')
@@ -160,7 +210,7 @@ def main():
 
     if ent_f and sai_f:
         try:
-            # 2. Definição de Colunas (Fiel ao seu arquivo)
+            # 2. Definição de Colunas
             cols_ent = ['NUM_NF', 'DATA_EMISSAO', 'CNPJ', 'UF', 'VLR_NF', 'AC', 'CFOP', 'COD_PROD', 'DESCR', 'NCM', 'UNID', 'VUNIT', 'QTDE', 'VPROD', 'DESC', 'FRETE', 'SEG', 'DESP', 'VC', 'CST-ICMS', 'BC-ICMS', 'VLR-ICMS', 'BC-ICMS-ST', 'ICMS-ST', 'VLR_IPI', 'CST_PIS', 'BC_PIS', 'VLR_PIS', 'CST_COF', 'BC_COF', 'VLR_COF']
             cols_sai = ['NF', 'DATA_EMISSAO', 'CNPJ', 'Ufp', 'VC', 'AC', 'CFOP', 'COD_ITEM', 'DESC_ITEM', 'NCM', 'UND', 'VUNIT', 'QTDE', 'VITEM', 'DESC', 'FRETE', 'SEG', 'OUTRAS', 'VC_ITEM', 'CST', 'BC_ICMS', 'ALIQ_ICMS', 'ICMS', 'BC_ICMSST', 'ICMSST', 'IPI', 'CST_PIS Escriturado', 'BC_PIS', 'PIS', 'CST_COF', 'BC_COF', 'COF']
 
@@ -177,7 +227,7 @@ def main():
             df_ent[['DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_CLIENTE_ERP', 'AÇÃO_DOMINIO']] = df_ent.apply(lambda r: auditoria_decisiva(r, 'entrada'), axis=1)
             df_sai[['DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_CLIENTE_ERP', 'AÇÃO_DOMINIO']] = df_sai.apply(lambda r: auditoria_decisiva(r, 'saida'), axis=1)
 
-            # Reordenação para visualização
+            # Reordenação
             df_ent = reordenar_audit(df_ent)
             df_sai = reordenar_audit(df_sai)
 
@@ -186,9 +236,13 @@ def main():
             v_st = df_sai['ICMSST'].sum() - df_ent['ICMS-ST'].sum()
             v_ipi = df_sai['IPI'].sum() - df_ent['VLR_IPI'].sum()
 
+            # 6. Geração do Resumo por CFOP (Estilo Livro P9)
+            livro_ent = gerar_resumo_cfop(df_ent, 'entrada')
+            livro_sai = gerar_resumo_cfop(df_sai, 'saida')
+
             st.success("Auditoria Concluída com Sucesso!")
 
-            # 6. Painel de Apuração (O que pagar?)
+            # 7. Painel de Apuração
             st.subheader("📊 Apuração Final (Débito vs Crédito)")
             resumo = pd.DataFrame([
                 {'Imposto': 'ICMS PRÓPRIO', 'Débitos': df_sai['ICMS'].sum(), 'Créditos': df_ent['VLR-ICMS'].sum(), 'Saldo': v_icms, 'Status': 'A RECOLHER' if v_icms > 0 else 'CREDOR'},
@@ -197,12 +251,26 @@ def main():
             ])
             st.dataframe(resumo.style.format({'Débitos': 'R$ {:,.2f}', 'Créditos': 'R$ {:,.2f}', 'Saldo': 'R$ {:,.2f}'}), use_container_width=True)
 
-            # 7. Prévias de Inconsistências (O que corrigir?)
+            # 8. Painel de Resumo por CFOP (NOVO - Solicitado)
+            st.markdown("---")
+            st.subheader("📖 Resumo por CFOP (Livro de Apuração)")
+            tabs_livro = st.tabs(["Entradas por CFOP", "Saídas por CFOP"])
+            with tabs_livro[0]:
+                st.dataframe(livro_ent.style.format({
+                    'Valor Contábil': 'R$ {:,.2f}', 'Base Cálculo': 'R$ {:,.2f}', 'ICMS': 'R$ {:,.2f}', 
+                    'ICMS ST': 'R$ {:,.2f}', 'IPI': 'R$ {:,.2f}', 'Isentas': 'R$ {:,.2f}', 'Outras': 'R$ {:,.2f}'
+                }), use_container_width=True)
+            with tabs_livro[1]:
+                st.dataframe(livro_sai.style.format({
+                    'Valor Contábil': 'R$ {:,.2f}', 'Base Cálculo': 'R$ {:,.2f}', 'ICMS': 'R$ {:,.2f}', 
+                    'ICMS ST': 'R$ {:,.2f}', 'IPI': 'R$ {:,.2f}', 'Isentas': 'R$ {:,.2f}', 'Outras': 'R$ {:,.2f}'
+                }), use_container_width=True)
+
+            # 9. Prévias de Inconsistências
             st.markdown("---")
             st.subheader("🚨 Inconsistências Detectadas (Com Plano de Ação)")
             
             c1, c2 = st.columns(2)
-            # Filtra apenas erros
             erros_sai = df_sai[df_sai['DIAGNÓSTICO'] != "Regular"]
             erros_ent = df_ent[df_ent['DIAGNÓSTICO'] != "Regular"]
 
@@ -216,19 +284,21 @@ def main():
                 if erros_ent.empty: st.info("Nenhuma inconsistência nas entradas.")
                 else: st.dataframe(erros_ent[['NUM_NF', 'CFOP', 'DIAGNÓSTICO', 'AÇÃO_DOMINIO']], use_container_width=True)
 
-            # 8. Exportação Completa
+            # 10. Exportação Completa
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 df_ent.to_excel(writer, sheet_name='Entradas Auditadas', index=False)
                 df_sai.to_excel(writer, sheet_name='Saídas Auditadas', index=False)
                 resumo.to_excel(writer, sheet_name='Apuração Final', index=False)
+                livro_ent.to_excel(writer, sheet_name='Resumo CFOP Entradas', index=False)
+                livro_sai.to_excel(writer, sheet_name='Resumo CFOP Saídas', index=False)
                 
-                # Formatação Condicional (Vermelho para Erro)
+                # Formatação
                 workbook = writer.book
                 fmt_red = workbook.add_format({'bg_color': '#FFC7CE'})
                 for sheet, df_ref in [('Entradas Auditadas', df_ent), ('Saídas Auditadas', df_sai)]:
                     ws = writer.sheets[sheet]
-                    ws.set_column('A:Z', 22) # Largura legível
+                    ws.set_column('A:Z', 22)
                     for i, val in enumerate(df_ref['DIAGNÓSTICO']):
                         if val != "Regular": ws.set_row(i + 1, None, fmt_red)
 

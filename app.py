@@ -5,11 +5,17 @@ import io
 # Configuração da página - O Curador
 st.set_page_config(page_title="Curador - Auditoria Fiscal Robusta", layout="wide")
 
-# --- FUNÇÃO DE RESET ---
+# --- GERENCIAMENTO DE SESSÃO (CORREÇÃO DO ERRO) ---
+if 'id_auditoria' not in st.session_state:
+    st.session_state['id_auditoria'] = 0
+
 def reset_auditoria():
-    """Limpa os arquivos da memória para nova análise."""
-    st.session_state['arquivo_entrada'] = None
-    st.session_state['arquivo_saida'] = None
+    """
+    Incrementa o ID da auditoria.
+    Isso força o Streamlit a recriar os widgets de upload, limpando os arquivos
+    sem violar as regras de atribuição de valor (StreamlitValueAssignmentNotAllowedError).
+    """
+    st.session_state['id_auditoria'] += 1
 
 # --- FUNÇÕES UTILITÁRIAS ---
 def clean_numeric_col(df, col_name):
@@ -35,7 +41,7 @@ def clean_cfop_col(df, col_name='CFOP'):
 def gerar_livro_p9(df, tipo='entrada'):
     """
     Gera o Livro Fiscal P9 COMPLETO.
-    Lista TODOS os CFOPs, sem exceção.
+    Lista TODOS os CFOPs, sem exceção (dropna=False).
     """
     dff = df.copy()
     
@@ -198,15 +204,20 @@ def main():
     with col_title:
         st.title("⚖️ Curador: Auditoria Fiscal Robusta")
     with col_btn:
-        st.button("🔄 Resetar Auditoria", on_click=reset_auditoria, type="primary")
+        st.button("🔄 Nova Auditoria (Limpar)", on_click=reset_auditoria, type="primary")
     
     st.markdown("---")
     
+    # 1. Upload Centralizado com CHAVE DINÂMICA
+    # Isso evita o erro de 'StreamlitValueAssignmentNotAllowedError'
+    chave_ent = f"entrada_{st.session_state['id_auditoria']}"
+    chave_sai = f"saida_{st.session_state['id_auditoria']}"
+    
     c1, c2 = st.columns(2)
     with c1: 
-        ent_f = st.file_uploader("📥 Entradas (CSV)", type=["csv"], key='arquivo_entrada')
+        ent_f = st.file_uploader("📥 Entradas (CSV)", type=["csv"], key=chave_ent)
     with c2: 
-        sai_f = st.file_uploader("📤 Saídas (CSV)", type=["csv"], key='arquivo_saida')
+        sai_f = st.file_uploader("📤 Saídas (CSV)", type=["csv"], key=chave_sai)
 
     if ent_f and sai_f:
         try:

@@ -20,6 +20,12 @@ def clean_numeric_col(df, col_name):
         df[col_name] = pd.to_numeric(s, errors='coerce').fillna(0.0)
     return df
 
+def clean_cfop_col(df, col_name='CFOP'):
+    """Padroniza a coluna CFOP removendo pontos e espaços para agrupamento correto."""
+    if col_name in df.columns:
+        df[col_name] = df[col_name].astype(str).str.replace('.', '', regex=False).str.strip()
+    return df
+
 def gerar_resumo_cfop(df, tipo='entrada'):
     """
     Gera um resumo estilo Livro de Apuração (Modelo P9), agrupando por CFOP.
@@ -43,8 +49,6 @@ def gerar_resumo_cfop(df, tipo='entrada'):
         col_cst = 'CST'
 
     # Lógica de Isentas/Outras (Simplificada para Resumo)
-    # Se CST for Isento (40, 41) -> Vai para Isentas
-    # Se CST for Outros (50, 90) ou houver diferença de base -> Vai para Outras
     def calcular_colunas_livro(row):
         cst = str(row[col_cst])[-2:]
         vc = row[col_vc]
@@ -76,7 +80,7 @@ def auditoria_decisiva(row, tipo='saida'):
     Cruza CFOP, CST, Alíquotas e Valores para determinar a AÇÃO EXATA.
     """
     # 1. Extração de Dados
-    cfop = str(row['CFOP']).strip().replace('.', '')
+    cfop = str(row['CFOP']).strip() # Já limpo na main
     cst_full = str(row['CST-ICMS'] if tipo == 'entrada' else row['CST']).strip()
     cst = cst_full[-2:] if len(cst_full) >= 2 else cst_full.zfill(2)
     
@@ -96,6 +100,7 @@ def auditoria_decisiva(row, tipo='saida'):
     cst_st_permitido = ['10', '30', '70', '90']  # Aceita valor
     cfop_st_gerador = ['5401', '5403', '6401', '6403', '5405', '6405'] # Operações de ST
     cfop_industrial = ['5101', '6101']           # Operações de IPI
+    cfop_uso_consumo = ['1556', '2556']          # Uso e Consumo
     
     # 3. Listas de Saída
     diag, legal, prevent, dominio = [], [], [], []
@@ -104,6 +109,13 @@ def auditoria_decisiva(row, tipo='saida'):
     # ANÁLISE 1: ICMS PRÓPRIO
     # -------------------------------------------------------------------------
     
+    # CASO: Crédito em Uso e Consumo (1556/2556) - AJUSTE FINO SOLICITADO
+    if tipo == 'entrada' and cfop in cfop_uso_consumo and vlr_icms > 0:
+        diag.append("ALERTA: Crédito tomado em Uso/Consumo (1556/2556).")
+        legal.append("VALIDAR: Permitido apenas se for insumo produtivo (desgaste imediato) ou Ativo Imobilizado (1/48).")
+        prevent.append("Verificar se o item é material de escritório (indevido) ou produção (devido).")
+        dominio.append("Se correto: Manter. Se indevido: Alterar CST para 90/Outras e estornar crédito.")
+
     # CASO CRÍTICO: CFOP 6403 (Substituto) sem ICMS Próprio
     if tipo == 'saida' and cfop == '6403' and vlr_icms == 0:
         diag.append("OMISSÃO GRAVE: CFOP 6403 exige destaque de ICMS Próprio + ST.")
@@ -217,11 +229,16 @@ def main():
             df_ent = pd.read_csv(ent_f, sep=';', encoding='latin-1', header=None, names=cols_ent)
             df_sai = pd.read_csv(sai_f, sep=';', encoding='latin-1', header=None, names=cols_sai)
 
-            # 3. Limpeza de Dados
+            # 3. Limpeza de Dados (Global)
+            # Limpeza Numérica
             cols_num_ent = ['VLR-ICMS', 'VLR_IPI', 'BC-ICMS', 'VC', 'ICMS-ST', 'VPROD', 'FRETE', 'DESC']
             cols_num_sai = ['ICMS', 'IPI', 'BC_ICMS', 'VC_ITEM', 'ALIQ_ICMS', 'ICMSST', 'VITEM', 'FRETE', 'DESC']
             for c in cols_num_ent: df_ent = clean_numeric_col(df_ent, c)
             for c in cols_num_sai: df_sai = clean_numeric_col(df_sai, c)
+            
+            # Limpeza do CFOP (Remover pontos e espaços para garantir leitura correta)
+            df_ent = clean_cfop_col(df_ent, 'CFOP')
+            df_sai = clean_cfop_col(df_sai, 'CFOP')
 
             # 4. Aplicação da Auditoria Robusta
             df_ent[['DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_CLIENTE_ERP', 'AÇÃO_DOMINIO']] = df_ent.apply(lambda r: auditoria_decisiva(r, 'entrada'), axis=1)

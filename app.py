@@ -3,7 +3,7 @@ import pandas as pd
 import io
 
 # Configuração da página - O Curador
-st.set_page_config(page_title="Curador - Malha Fiscal Total", layout="wide")
+st.set_page_config(page_title="Curador - Auditoria Fiscal e Malha Total", layout="wide")
 
 def clean_numeric_col(df, col_name):
     """Limpeza técnica de colunas numéricas para precisão fiscal absoluta."""
@@ -36,67 +36,71 @@ def auditoria_total(row, tipo='saida'):
     # --- MALHA ICMS PRÓPRIO ---
     if cfop == '6403' and vlr_icms == 0:
         erros.append("ICMS Próprio zerado no CFOP 6403.")
-        cliente.append("Destacar ICMS Próprio na NF-e de Substituto.")
-        dominio.append("Configurar Acumulador para calcular ICMS Próprio em operações de ST.")
+        cliente.append("Destacar ICMS Próprio na NF-e de Substituto Tributário.")
+        dominio.append("Configurar Acumulador para calcular ICMS Próprio em operações de ST (Substituto).")
     
     if tipo == 'saida' and vlr_icms > 0 and bc_icms > 0:
         calc = round(bc_icms * (aliq / 100), 2)
         if abs(calc - vlr_icms) > 0.05:
             erros.append(f"Cálculo ICMS divergente (Esperado: {calc}).")
-            cliente.append("Revisar alíquota ou base de cálculo no faturamento.")
-            dominio.append("Verificar vigência da alíquota no cadastro do produto.")
+            cliente.append("Revisar faturamento: valor destacado não condiz com Base x Alíquota.")
+            dominio.append("Verificar vigência da alíquota ou exceções de imposto no cadastro.")
 
     # --- MALHA ICMS ST ---
     if cst in cst_st and vlr_st == 0:
         erros.append(f"CST {cst_full} exige ICMS ST, mas valor está zerado.")
-        cliente.append("Calcular e destacar o valor do ICMS ST retido.")
-        dominio.append("No acumulador, aba Estadual, marcar 'Gera guia de ST'.")
+        cliente.append("Calcular e informar o valor do ICMS ST retido na nota.")
+        dominio.append("No acumulador, aba Estadual, marcar 'Gera guia de recolhimento de ST'.")
     elif vlr_st > 0 and cst not in cst_st and cst != '60':
         erros.append(f"Destaque de ST indevido para CST {cst_full}.")
-        cliente.append("Corrigir CST para 10 ou remover valor de ST.")
+        cliente.append("Remover ST ou ajustar CST para 10, 30, 70 ou 90.")
 
     # --- MALHA IPI ---
     if cfop in ['5101', '6101'] and vlr_ipi == 0:
         erros.append("Venda industrial sem destaque de IPI.")
         cliente.append("Informar IPI (Saída de Produção Própria).")
-        dominio.append("Vincular tabela de IPI no produto e usar Acumulador industrial.")
+        dominio.append("Vincular tabela de IPI no produto e usar Acumulador com incidência de IPI.")
 
     # --- MALHA UF (Interestadual) ---
     if tipo == 'saida' and cfop.startswith('6'):
         regiao_7 = ['AC', 'AL', 'AM', 'AP', 'BA', 'CE', 'DF', 'ES', 'GO', 'MA', 'MS', 'MT', 'PA', 'PB', 'PE', 'PI', 'RN', 'RO', 'RR', 'SE', 'TO']
         if uf_dest in regiao_7 and aliq not in [7.0, 4.0]:
-            erros.append(f"Alíquota incorreta para {uf_dest} (7%).")
-            cliente.append(f"Alterar alíquota interestadual para 7% para {uf_dest}.")
+            erros.append(f"Alíquota incorreta para {uf_dest}: espera-se 7% (ou 4%).")
+            cliente.append(f"Ajustar alíquota interestadual para 7% para destino {uf_dest}.")
 
     res = {
         'DIAGNOSTICO': " | ".join(erros) if erros else "Escrituração Regular",
-        'ACAO_CLIENTE': " | ".join(cliente) if cliente else "-",
+        'CORRECAO_CLIENTE': " | ".join(cliente) if cliente else "-",
         'AJUSTE_DOMINIO': " | ".join(dominio) if dominio else "-"
     }
     return pd.Series(res)
 
 def gerar_livro_p9(df, tipo='entrada'):
-    """Resumo por CFOP no padrão do Livro Registro."""
+    """Agrupamento por CFOP no padrão do Livro Registro de ICMS."""
     if tipo == 'entrada':
         df['Isentas'] = df.apply(lambda x: x['VC'] if str(x['CST-ICMS'])[-2:] in ['40', '41'] else 0, axis=1)
         df['Outras'] = df.apply(lambda x: x['VC'] if str(x['CST-ICMS'])[-2:] not in ['00', '10', '20', '40', '41'] else 0, axis=1)
         res = df.groupby('CFOP').agg({'VC': 'sum', 'BC-ICMS': 'sum', 'VLR-ICMS': 'sum', 'ICMS-ST': 'sum', 'VLR_IPI': 'sum', 'Isentas': 'sum', 'Outras': 'sum'}).reset_index()
+        res.columns = ['CFOP', 'Vlr Contábil', 'Base ICMS', 'ICMS Cred.', 'ICMS ST', 'IPI Cred.', 'Isentas', 'Outras']
     else:
         df['Isentas'] = df.apply(lambda x: x['VC_ITEM'] if str(x['CST'])[-2:] in ['40', '41'] else 0, axis=1)
         df['Outras'] = df.apply(lambda x: x['VC_ITEM'] if str(x['CST'])[-2:] not in ['00', '10', '20', '40', '41'] else 0, axis=1)
         res = df.groupby('CFOP').agg({'VC_ITEM': 'sum', 'BC_ICMS': 'sum', 'ICMS': 'sum', 'ICMSST': 'sum', 'IPI': 'sum', 'Isentas': 'sum', 'Outras': 'sum'}).reset_index()
+        res.columns = ['CFOP', 'Vlr Contábil', 'Base ICMS', 'ICMS Deb.', 'ICMS ST', 'IPI Deb.', 'Isentas', 'Outras']
     return res
 
 def main():
-    st.title("⚖️ Curador: Malha Fiscal e Consultoria (ICMS / ST / IPI)")
+    st.title("⚖️ Curador: Acervo Fiscal, Malha e Auditoria Total")
     st.markdown("---")
     
-    c1, c2 = st.columns(2)
-    with c1: ent_file = st.file_uploader("📥 Entradas (CSV)", type=["csv"])
-    with c2: sai_file = st.file_uploader("📤 Saídas (CSV)", type=["csv"])
+    st.sidebar.header("⚖️ Upload dos Pergaminhos")
+    template_file = st.sidebar.file_uploader("📂 Planilha de Conferência (Template)", type=["xlsx"])
+    ent_file = st.sidebar.file_uploader("📥 Entradas (CSV)", type=["csv"])
+    sai_file = st.sidebar.file_uploader("📤 Saídas (CSV)", type=["csv"])
 
     if ent_file and sai_file:
         try:
+            # Definição das colunas rigorosas
             cols_ent = ['NUM_NF', 'DATA_EMISSAO', 'CNPJ', 'UF', 'VLR_NF', 'AC', 'CFOP', 'COD_PROD', 'DESCR', 'NCM', 'UNID', 'VUNIT', 'QTDE', 'VPROD', 'DESC', 'FRETE', 'SEG', 'DESP', 'VC', 'CST-ICMS', 'BC-ICMS', 'VLR-ICMS', 'BC-ICMS-ST', 'ICMS-ST', 'VLR_IPI', 'CST_PIS', 'BC_PIS', 'VLR_PIS', 'CST_COF', 'BC_COF', 'VLR_COF']
             cols_sai = ['NF', 'DATA_EMISSAO', 'CNPJ', 'Ufp', 'VC', 'AC', 'CFOP', 'COD_ITEM', 'DESC_ITEM', 'NCM', 'UND', 'VUNIT', 'QTDE', 'VITEM', 'DESC', 'FRETE', 'SEG', 'OUTRAS', 'VC_ITEM', 'CST', 'BC_ICMS', 'ALIQ_ICMS', 'ICMS', 'BC_ICMSST', 'ICMSST', 'IPI', 'CST_PIS Escriturado', 'BC_PIS', 'PIS', 'CST_COF', 'BC_COF', 'COF']
 
@@ -106,55 +110,62 @@ def main():
             for c in ['VLR-ICMS', 'VLR_IPI', 'BC-ICMS', 'VC', 'ICMS-ST']: df_ent = clean_numeric_col(df_ent, c)
             for c in ['ICMS', 'IPI', 'BC_ICMS', 'VC_ITEM', 'ALIQ_ICMS', 'ICMSST']: df_sai = clean_numeric_col(df_sai, c)
 
-            # Execução da Auditoria Analítica
+            # Processamento da Malha e Consultoria
             df_ent[['DIAGNOSTICO', 'CORRECAO_CLIENTE', 'AJUSTE_DOMINIO']] = df_ent.apply(lambda r: auditoria_total(r, 'entrada'), axis=1)
             df_sai[['DIAGNOSTICO', 'CORRECAO_CLIENTE', 'AJUSTE_DOMINIO']] = df_sai.apply(lambda r: auditoria_total(r, 'saida'), axis=1)
 
-            # Cálculos de Saldo
+            livro_ent = gerar_livro_p9(df_ent, 'entrada')
+            livro_sai = gerar_livro_p9(df_sai, 'saida')
+
+            # Saldos Finais
             v_icms = df_sai['ICMS'].sum() - df_ent['VLR-ICMS'].sum()
             v_st = df_sai['ICMSST'].sum() - df_ent['ICMS-ST'].sum()
             v_ipi = df_sai['IPI'].sum() - df_ent['VLR_IPI'].sum()
 
-            st.success("Análise de Malha Concluída!")
+            st.success("Auditoria analítica concluída! Verifique o dashboard e baixe o arquivo completo.")
             
             # Dashboard
             m1, m2, m3 = st.columns(3)
-            m1.metric("Saldo ICMS Próprio", f"R$ {v_icms:,.2f}", delta="Recolher" if v_icms > 0 else "Credor")
-            m2.metric("Saldo ICMS ST", f"R$ {v_st:,.2f}", delta="Recolher" if v_st > 0 else "Credor")
-            m3.metric("Saldo IPI", f"R$ {v_ipi:,.2f}", delta="Recolher" if v_ipi > 0 else "Credor")
+            m1.metric("Saldo ICMS Próprio", f"R$ {v_icms:,.2f}", delta="A Recolher" if v_icms > 0 else "Credor")
+            m2.metric("Saldo ICMS ST", f"R$ {v_st:,.2f}", delta="A Recolher" if v_st > 0 else "Credor")
+            m3.metric("Saldo IPI", f"R$ {v_ipi:,.2f}", delta="A Recolher" if v_ipi > 0 else "Credor")
 
-            tabs = st.tabs(["🔎 Alertas de Malha", "📖 Livros Fiscais", "📊 Apuração Final"])
-            with tabs[0]:
-                erros = pd.concat([
-                    df_ent[df_ent['DIAGNOSTICO'] != "Escrituração Regular"][['NUM_NF', 'CFOP', 'DIAGNOSTICO', 'CORRECAO_CLIENTE', 'AJUSTE_DOMINIO']].rename(columns={'NUM_NF': 'Doc'}),
-                    df_sai[df_sai['DIAGNOSTICO'] != "Escrituração Regular"][['NF', 'CFOP', 'DIAGNOSTICO', 'CORRECAO_CLIENTE', 'AJUSTE_DOMINIO']].rename(columns={'NF': 'Doc'})
-                ])
-                st.dataframe(erros, use_container_width=True)
-            with tabs[2]:
-                st.table(pd.DataFrame([
+            # Exportação Mantendo Abas do Excel Original
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                # Se o usuário subir o template, preservamos as abas estáticas dele
+                if template_file:
+                    xls = pd.ExcelFile(template_file)
+                    for sheet in xls.sheet_names:
+                        # Pula as abas que vamos gerar de novo
+                        if sheet not in ['Entradas Gerencial', 'Saídas Gerencial', 'Apuração de ICMS e IPI']:
+                            pd.read_excel(xls, sheet_name=sheet).to_excel(writer, sheet_name=sheet, index=False)
+                
+                # Geramos as abas de trabalho (Mantendo nomes solicitados no início)
+                df_ent.to_excel(writer, sheet_name='Entradas Gerencial', index=False)
+                df_sai.to_excel(writer, sheet_name='Saídas Gerencial', index=False)
+                livro_ent.to_excel(writer, sheet_name='Resumo P9 Entradas', index=False)
+                livro_sai.to_excel(writer, sheet_name='Resumo P9 Saídas', index=False)
+                
+                df_apur = pd.DataFrame([
                     {'Imposto': 'ICMS Próprio', 'Débito': df_sai['ICMS'].sum(), 'Crédito': -df_ent['VLR-ICMS'].sum(), 'Saldo': v_icms},
                     {'Imposto': 'ICMS ST', 'Débito': df_sai['ICMSST'].sum(), 'Crédito': -df_ent['ICMS-ST'].sum(), 'Saldo': v_st},
                     {'Imposto': 'IPI', 'Débito': df_sai['IPI'].sum(), 'Crédito': -df_ent['VLR_IPI'].sum(), 'Saldo': v_ipi}
-                ]))
+                ])
+                df_apur.to_excel(writer, sheet_name='Apuração de ICMS e IPI', index=False)
 
-            # Exportação
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df_ent.to_excel(writer, sheet_name='Entradas Analítico', index=False)
-                df_sai.to_excel(writer, sheet_name='Saídas Analítico', index=False)
-                df_apur = pd.DataFrame([{'ICMS': v_icms, 'ST': v_st, 'IPI': v_ipi}])
-                df_apur.to_excel(writer, sheet_name='Resumo Saldos', index=False)
-                
+                # Formatação Visual de Auditoria
                 workbook = writer.book
-                fmt_red = workbook.add_format({'bg_color': '#FFC7CE'})
-                for sheet in ['Entradas Analítico', 'Saídas Analítico']:
+                fmt_red = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
+                fmt_num = workbook.add_format({'num_format': '#,##0.00'})
+                for sheet in ['Entradas Gerencial', 'Saídas Gerencial']:
                     ws = writer.sheets[sheet]
-                    ws.set_column('A:AN', 18)
+                    ws.set_column('A:AN', 18, fmt_num)
                     df_ref = df_ent if 'Entradas' in sheet else df_sai
                     for i, val in enumerate(df_ref['DIAGNOSTICO']):
                         if val != "Escrituração Regular": ws.set_row(i + 1, None, fmt_red)
 
-            st.download_button("📥 Baixar Auditoria do Curador", output.getvalue(), "Curador_Malha_Auditada.xlsx")
+            st.download_button("📥 Baixar Planilha Completa (O Curador)", output.getvalue(), "Conferência_Curador_Malha_Total.xlsx")
 
         except Exception as e:
             st.error(f"Erro Crítico: {e}")

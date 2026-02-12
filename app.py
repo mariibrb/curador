@@ -2,9 +2,10 @@ import streamlit as st
 import pandas as pd
 import io
 import xml.etree.ElementTree as ET
+import zipfile
 
 # Configuração da página - O Curador
-st.set_page_config(page_title="Curador - Auditoria Fiscal & Fretes", layout="wide")
+st.set_page_config(page_title="Curador - Auditoria Fiscal & Fretes (Matrioska)", layout="wide")
 
 # --- FUNÇÃO DE RESET ---
 def reset_auditoria():
@@ -33,74 +34,102 @@ def clean_cfop_col(df, col_name='CFOP'):
         df[col_name] = df[col_name].replace(['nan', 'None', ''], 'SEM_CFOP')
     return df
 
-def processar_xml_transporte(uploaded_files):
+# --- MÓDULO DE PROCESSAMENTO XML RECURSIVO (MATRIOSKA) ---
+def processar_arquivo_recursivo(arquivo_bytes, nome_arquivo, lista_dados, contadores):
     """
-    Lê arquivos XML e FILTRA apenas os de Transporte (CT-e).
-    Ignora DANFEs (NF-e) misturadas no meio.
+    Função RECURSIVA que mergulha em ZIPs dentro de ZIPs.
+    Se for ZIP: Abre e chama a si mesma para cada arquivo dentro.
+    Se for XML: Processa e extrai dados se for CT-e.
     """
-    dados_cte = []
-    qtd_nfe_ignorada = 0
-    
-    for file in uploaded_files:
+    # Verifica se é um arquivo ZIP válido
+    if zipfile.is_zipfile(io.BytesIO(arquivo_bytes)):
         try:
-            tree = ET.parse(file)
+            with zipfile.ZipFile(io.BytesIO(arquivo_bytes)) as z:
+                for nome_interno in z.namelist():
+                    # Ignora pastas ou arquivos mac/sistema
+                    if nome_interno.endswith('/') or '__MACOSX' in nome_interno:
+                        continue
+                    
+                    conteudo_interno = z.read(nome_interno)
+                    # RECURSÃO: Chama a função novamente para o arquivo de dentro
+                    processar_arquivo_recursivo(conteudo_interno, nome_interno, lista_dados, contadores)
+        except Exception as e:
+            print(f"Erro ao abrir ZIP {nome_arquivo}: {e}")
+            return
+
+    # Se não for ZIP, tenta processar como XML
+    else:
+        try:
+            # Tenta ler como XML
+            tree = ET.parse(io.BytesIO(arquivo_bytes))
             root = tree.getroot()
             
-            # Namespaces Oficiais
+            # Namespaces
             ns_cte = {'cte': 'http://www.portalfiscal.inf.br/cte'}
             
-            # --- FILTRO DE TIPO DE ARQUIVO ---
-            # Verifica se existe a tag <infCte>. Se não existir, não é transporte.
+            # FILTRO: É CT-e?
             inf_cte = root.find('.//cte:infCte', ns_cte)
             
             if inf_cte is None:
-                # Não é CTe (provavelmente é NFe/DANFE). Ignora.
-                qtd_nfe_ignorada += 1
-                continue 
-                
-            # --- EXTRAÇÃO DE DADOS (Só entra aqui se for CTe) ---
-            chave = inf_cte.attrib.get('Id', '')[3:] # Remove prefixo 'CTe'
+                # Não é CT-e (provavelmente NFe/DANFE). Ignora.
+                contadores['ignorados'] += 1
+                return
             
-            # Busca Emitente
+            # Se chegou aqui, É UM CT-E VÁLIDO. Extrai dados.
+            contadores['ctes'] += 1
+            chave = inf_cte.attrib.get('Id', '')[3:]
+            
             emit_tag = inf_cte.find('.//cte:emit/cte:xNome', ns_cte)
             emit = emit_tag.text if emit_tag is not None else "Desconhecido"
             
-            # Busca Valor da Prestação
             v_prest_tag = inf_cte.find('.//cte:vPrest/cte:vTPrest', ns_cte)
             v_prest = float(v_prest_tag.text) if v_prest_tag is not None else 0.0
             
-            # Busca ICMS (Pode estar em ICMS00, ICMS20, ICMS90, ICMSSN, etc)
             icms_val = 0.0
             imp = inf_cte.find('.//cte:imp/cte:ICMS', ns_cte)
             
             if imp is not None:
-                # Itera sobre os filhos (qualquer CST) para achar a tag vICMS
                 for child in imp:
                     v_icms_tag = child.find('cte:vICMS', ns_cte)
                     if v_icms_tag is not None:
                         icms_val = float(v_icms_tag.text)
                         break
             
-            dados_cte.append({
-                'Arquivo': file.name,
+            lista_dados.append({
+                'Origem': nome_arquivo, # Nome do arquivo (ou do arquivo dentro do zip)
                 'Chave': chave,
                 'Transportadora': emit,
                 'Valor Frete': v_prest,
                 'Crédito ICMS': icms_val
             })
             
+        except ET.ParseError:
+            # Não é XML (pode ser PDF, TXT dentro do zip). Ignora.
+            pass
         except Exception as e:
-            # Se der erro de leitura, apenas avisa no log, mas não para
-            print(f"Erro ao ler {file.name}: {e}")
-            continue
+            # Outros erros
+            pass
+
+def processar_pacote_xml(uploaded_files):
+    """
+    Ponto de entrada para processamento dos uploads.
+    """
+    dados_cte = []
+    contadores = {'ctes': 0, 'ignorados': 0}
+    
+    for file in uploaded_files:
+        # Lê o conteúdo bruto do upload
+        bytes_arquivo = file.read()
+        # Inicia a recursão
+        processar_arquivo_recursivo(bytes_arquivo, file.name, dados_cte, contadores)
             
     if not dados_cte:
-        return pd.DataFrame(), 0.0, qtd_nfe_ignorada
+        return pd.DataFrame(), 0.0, contadores['ignorados']
         
     df_cte = pd.DataFrame(dados_cte)
-    total_icms_transporte = df_cte['Crédito ICMS'].sum()
+    total_icms = df_cte['Crédito ICMS'].sum()
     
-    return df_cte, total_icms_transporte, qtd_nfe_ignorada
+    return df_cte, total_icms, contadores['ignorados']
 
 def gerar_livro_p9(df, tipo='entrada'):
     """Gera o Livro Fiscal P9 COMPLETO."""
@@ -243,18 +272,18 @@ def main():
     c1, c2, c3 = st.columns(3)
     with c1: ent_f = st.file_uploader("📥 Entradas (CSV)", type=["csv"], key=chave_ent)
     with c2: sai_f = st.file_uploader("📤 Saídas (CSV)", type=["csv"], key=chave_sai)
-    with c3: xml_f = st.file_uploader("🚚 XMLs (CT-e e NF-e Misturados)", type=["xml"], accept_multiple_files=True, key=chave_xml)
+    # Uploader que aceita XML e ZIP (Matrioska)
+    with c3: xml_f = st.file_uploader("🚚 XMLs Frete (XML ou ZIP)", type=["xml", "zip"], accept_multiple_files=True, key=chave_xml)
 
     if ent_f and sai_f:
         try:
-            # 1. Leitura
+            # 1. Leitura e Limpeza
             cols_ent = ['NUM_NF', 'DATA_EMISSAO', 'CNPJ', 'UF', 'VLR_NF', 'AC', 'CFOP', 'COD_PROD', 'DESCR', 'NCM', 'UNID', 'VUNIT', 'QTDE', 'VPROD', 'DESC', 'FRETE', 'SEG', 'DESP', 'VC', 'CST-ICMS', 'BC-ICMS', 'VLR-ICMS', 'BC-ICMS-ST', 'ICMS-ST', 'VLR_IPI', 'CST_PIS', 'BC_PIS', 'VLR_PIS', 'CST_COF', 'BC_COF', 'VLR_COF']
             cols_sai = ['NF', 'DATA_EMISSAO', 'CNPJ', 'Ufp', 'VC', 'AC', 'CFOP', 'COD_ITEM', 'DESC_ITEM', 'NCM', 'UND', 'VUNIT', 'QTDE', 'VITEM', 'DESC', 'FRETE', 'SEG', 'OUTRAS', 'VC_ITEM', 'CST', 'BC_ICMS', 'ALIQ_ICMS', 'ICMS', 'BC_ICMSST', 'ICMSST', 'IPI', 'CST_PIS Escriturado', 'BC_PIS', 'PIS', 'CST_COF', 'BC_COF', 'COF']
 
             df_ent = pd.read_csv(ent_f, sep=';', encoding='latin-1', header=None, names=cols_ent)
             df_sai = pd.read_csv(sai_f, sep=';', encoding='latin-1', header=None, names=cols_sai)
 
-            # 2. Limpeza
             cols_num_ent = ['VLR-ICMS', 'VLR_IPI', 'BC-ICMS', 'VC', 'ICMS-ST', 'VPROD', 'FRETE', 'DESC']
             cols_num_sai = ['ICMS', 'IPI', 'BC_ICMS', 'VC_ITEM', 'ALIQ_ICMS', 'ICMSST', 'VITEM', 'FRETE', 'DESC']
             for c in cols_num_ent: df_ent = clean_numeric_col(df_ent, c)
@@ -263,33 +292,32 @@ def main():
             df_ent = clean_cfop_col(df_ent, 'CFOP')
             df_sai = clean_cfop_col(df_sai, 'CFOP')
 
-            # 3. Auditoria
+            # 2. Auditoria e Apuração 1
             df_ent[['DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_CLIENTE_ERP', 'AÇÃO_DOMINIO']] = df_ent.apply(lambda r: auditoria_decisiva(r, 'entrada'), axis=1)
             df_sai[['DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_CLIENTE_ERP', 'AÇÃO_DOMINIO']] = df_sai.apply(lambda r: auditoria_decisiva(r, 'saida'), axis=1)
             
             df_ent = reordenar_audit(df_ent)
             df_sai = reordenar_audit(df_sai)
 
-            # 4. Saldos APURAÇÃO 1
             v_icms = df_sai['ICMS'].sum() - df_ent['VLR-ICMS'].sum()
             v_st = df_sai['ICMSST'].sum() - df_ent['ICMS-ST'].sum()
             v_ipi = df_sai['IPI'].sum() - df_ent['VLR_IPI'].sum()
 
-            # 5. Processamento XML (Filtro CTe)
+            # 3. Processamento XML Matrioska (ZIP dentro de ZIP)
             credito_transporte = 0.0
             nfe_ignoradas = 0
             df_cte_detalhe = pd.DataFrame()
             
             if xml_f:
-                df_cte_detalhe, credito_transporte, nfe_ignoradas = processar_xml_transporte(xml_f)
+                df_cte_detalhe, credito_transporte, nfe_ignoradas = processar_pacote_xml(xml_f)
 
-            # 6. Livros
+            # 4. Livros
             livro_ent = gerar_livro_p9(df_ent, 'entrada')
             livro_sai = gerar_livro_p9(df_sai, 'saida')
 
-            st.success("Auditoria Concluída!")
+            st.success("Auditoria Completa (CSV + XML Matrioska) Concluída!")
 
-            # --- PAINEL 1: APURAÇÃO ORIGINAL ---
+            # --- APURAÇÃO 1 ---
             st.subheader("💰 Apuração 1: Baseada nos Arquivos CSV (Domínio)")
             resumo_1 = pd.DataFrame([
                 {'Imposto': 'ICMS PRÓPRIO', 'Débitos': df_sai['ICMS'].sum(), 'Créditos': df_ent['VLR-ICMS'].sum(), 'Saldo': v_icms, 'Status': 'A RECOLHER' if v_icms > 0 else 'CREDOR'},
@@ -298,19 +326,19 @@ def main():
             ])
             st.dataframe(resumo_1.style.format({'Débitos': 'R$ {:,.2f}', 'Créditos': 'R$ {:,.2f}', 'Saldo': 'R$ {:,.2f}'}), use_container_width=True)
 
-            # --- PAINEL 2: APURAÇÃO 2 (COM FRETE) ---
+            # --- APURAÇÃO 2 ---
             if xml_f:
                 st.markdown("---")
-                st.subheader("🚚 Apuração 2: Considerando Crédito de Frete (XML)")
+                st.subheader("🚚 Apuração 2: Considerando Frete (XML/ZIP)")
                 if nfe_ignoradas > 0:
-                    st.warning(f"⚠️ Atenção: {nfe_ignoradas} arquivos NF-e/DANFE foram ignorados. Apenas CT-e foram somados.")
+                    st.warning(f"⚠️ {nfe_ignoradas} arquivos ignorados (NF-e, DANFE, PDF ou outros). Apenas CT-e considerados.")
                 
                 v_icms_final = v_icms - credito_transporte
                 status_final = 'A RECOLHER' if v_icms_final > 0 else 'CREDOR'
                 
                 resumo_2 = pd.DataFrame([
                     {'Descrição': 'Saldo da Apuração 1 (CSV)', 'Valor': v_icms},
-                    {'Descrição': '(-) Crédito de Transporte (CT-e XML)', 'Valor': -credito_transporte},
+                    {'Descrição': '(-) Crédito de Transporte (XML/ZIP)', 'Valor': -credito_transporte},
                     {'Descrição': f'(=) NOVO SALDO ICMS ({status_final})', 'Valor': v_icms_final}
                 ])
                 st.table(resumo_2.style.format({'Valor': 'R$ {:,.2f}'}))
@@ -318,7 +346,7 @@ def main():
                 with st.expander("Ver Detalhes dos CT-e Importados"):
                     st.dataframe(df_cte_detalhe)
 
-            # --- PAINEL 3: LIVRO FISCAL ---
+            # --- LIVROS ---
             st.markdown("---")
             st.subheader("📖 Livro Fiscal (Resumo por CFOP)")
             tabs_livro = st.tabs(["Livro Entradas (P9)", "Livro Saídas (P9)"])
@@ -326,7 +354,7 @@ def main():
             with tabs_livro[0]: st.dataframe(livro_ent.style.format(fmt), use_container_width=True)
             with tabs_livro[1]: st.dataframe(livro_sai.style.format(fmt), use_container_width=True)
 
-            # --- PAINEL 4: INCONSISTÊNCIAS ---
+            # --- INCONSISTÊNCIAS ---
             st.markdown("---")
             st.subheader("🚨 Inconsistências (Ação Necessária)")
             c1, c2 = st.columns(2)
@@ -360,7 +388,7 @@ def main():
                     for i, val in enumerate(df_ref['DIAGNÓSTICO']):
                         if val != "Regular": ws.set_row(i + 1, None, fmt_red)
 
-            st.download_button("📥 Baixar Livros e Auditoria", output.getvalue(), "Curador_Final.xlsx")
+            st.download_button("📥 Baixar Relatório Completo (CSV+XML)", output.getvalue(), "Curador_Supremo.xlsx")
 
         except Exception as e:
             st.error(f"Erro Crítico: {e}")

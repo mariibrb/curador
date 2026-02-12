@@ -60,15 +60,16 @@ def carregar_status_cte(status_file):
     except Exception:
         return []
 
-# --- MÓDULO MATRIOSKA (XML RECURSIVO) ---
-def processar_arquivo_recursivo(arquivo_bytes, nome_arquivo, lista_dados, contadores):
+# --- MÓDULO MATRIOSKA (XML RECURSIVO + ANTI-DUPLICIDADE) ---
+def processar_arquivo_recursivo(arquivo_bytes, nome_arquivo, lista_dados, contadores, chaves_unicas):
     if zipfile.is_zipfile(io.BytesIO(arquivo_bytes)):
         try:
             with zipfile.ZipFile(io.BytesIO(arquivo_bytes)) as z:
                 for nome_interno in z.namelist():
                     if nome_interno.endswith('/') or '__MACOSX' in nome_interno: continue
                     conteudo_interno = z.read(nome_interno)
-                    processar_arquivo_recursivo(conteudo_interno, nome_interno, lista_dados, contadores)
+                    # Passa o conjunto de chaves únicas adiante
+                    processar_arquivo_recursivo(conteudo_interno, nome_interno, lista_dados, contadores, chaves_unicas)
         except Exception: pass 
     else:
         try:
@@ -81,9 +82,17 @@ def processar_arquivo_recursivo(arquivo_bytes, nome_arquivo, lista_dados, contad
                 contadores['ignorados'] += 1
                 return 
             
+            chave = inf_cte.attrib.get('Id', '')[3:]
+            
+            # --- CHECAGEM DE DUPLICIDADE ---
+            if chave in chaves_unicas:
+                contadores['duplicados'] += 1
+                return # Já li essa nota antes, sai fora!
+            
+            # Se é nova, adiciona ao conjunto
+            chaves_unicas.add(chave)
             contadores['ctes'] += 1
             
-            chave = inf_cte.attrib.get('Id', '')[3:]
             cfop_tag = inf_cte.find('.//cte:ide/cte:CFOP', ns_cte)
             cfop = cfop_tag.text if cfop_tag is not None else "SEM_CFOP"
             
@@ -118,10 +127,12 @@ def processar_arquivo_recursivo(arquivo_bytes, nome_arquivo, lista_dados, contad
 
 def processar_pacote_xml(uploaded_files, chaves_canceladas):
     dados_cte = []
-    contadores = {'ctes': 0, 'ignorados': 0}
+    # Adicionado contador de duplicados e conjunto de chaves únicas
+    contadores = {'ctes': 0, 'ignorados': 0, 'duplicados': 0}
+    chaves_unicas = set()
     
     for file in uploaded_files:
-        processar_arquivo_recursivo(file.read(), file.name, dados_cte, contadores)
+        processar_arquivo_recursivo(file.read(), file.name, dados_cte, contadores, chaves_unicas)
             
     if not dados_cte:
         return pd.DataFrame(), pd.DataFrame(), 0.0, contadores, 0
@@ -306,18 +317,19 @@ def main():
             # 3. Processamento XML (Filtro Cancelados + Resumo CFOP)
             credito_cte = 0.0
             nfe_ign = 0
+            n_dup = 0
             qtd_cancel = 0
             df_cte_detalhe = pd.DataFrame()
             df_cte_cfop = pd.DataFrame()
             
             if xml_f:
-                # Carrega lista de cancelados
                 chaves_ruins = []
                 if status_f:
                     chaves_ruins = carregar_status_cte(status_f)
                     
                 df_cte_detalhe, df_cte_cfop, credito_cte, contadores, qtd_cancel = processar_pacote_xml(xml_f, chaves_ruins)
                 nfe_ign = contadores['ignorados']
+                n_dup = contadores.get('duplicados', 0)
 
             # 4. Livros P9
             livro_ent = gerar_livro_p9(df_ent, 'entrada')
@@ -345,6 +357,7 @@ def main():
                 cols_warn = st.columns(3)
                 if nfe_ign > 0: cols_warn[0].warning(f"⚠️ {nfe_ign} arquivos ignorados (não eram CT-e).")
                 if qtd_cancel > 0: cols_warn[1].error(f"🚫 {qtd_cancel} CT-es CANCELADOS/DENEGADOS foram excluídos.")
+                if n_dup > 0: cols_warn[2].info(f"ℹ️ {n_dup} duplicatas removidas.")
                 
                 v_icms2 = v_icms1 - credito_cte
                 status_final = 'A RECOLHER' if v_icms2 > 0 else 'CREDOR'
@@ -388,7 +401,7 @@ def main():
             with c1:
                 st.markdown("**Saídas**")
                 if erros_sai.empty: st.info("Ok")
-                else: st.dataframe(erros_sai[['NF', 'CFOP', 'DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_DOMINIO']], use_container_width=True)
+                else: st.dataframe(erros_sai[['NF', 'CFOP', 'DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_CLIENTE_ERP', 'AÇÃO_DOMINIO']], use_container_width=True)
             with c2:
                 st.markdown("**Entradas**")
                 if erros_ent.empty: st.info("Ok")
@@ -411,6 +424,8 @@ def main():
                 for sheet in ['Entradas Auditadas', 'Saídas Auditadas']:
                     ws = writer.sheets[sheet]
                     ws.set_column('A:Z', 22)
+                    for i, val in enumerate(df_ref['DIAGNÓSTICO']):
+                        if val != "Regular": ws.set_row(i + 1, None, fmt_red)
             
             st.download_button("📥 Baixar Relatório Completo", output.getvalue(), "Curador_Completo.xlsx")
 

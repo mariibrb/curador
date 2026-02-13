@@ -34,73 +34,51 @@ def clean_cfop_col(df, col_name='CFOP'):
     return df
 
 def carregar_status_cte(status_file):
-    """
-    Lê o relatório de status (Coluna A=Chave, Coluna E=Status).
-    Retorna uma LISTA de chaves que NÃO são válidas (Canceladas/Denegadas).
-    """
     try:
         if status_file.name.endswith('.csv'):
             df = pd.read_csv(status_file, header=None, dtype=str)
         else:
-            # Força engine openpyxl para evitar erros de compatibilidade
-            df = pd.read_excel(status_file, header=None, dtype=str, engine='openpyxl')
+            df = pd.read_excel(status_file, header=None, dtype=str)
         
-        # Garante que tem colunas suficientes (A=0, E=4)
         if df.shape[1] > 4:
             df_status = df.iloc[:, [0, 4]].copy()
             df_status.columns = ['Chave', 'Status']
-            
-            # Limpeza da Chave (Remove 'CTe', espaços)
             df_status['Chave'] = df_status['Chave'].astype(str).str.replace('CTe', '', regex=False).str.strip()
-            
-            # Filtra os ruins (Cancelada, Denegada, Inutilizada)
             mask_cancel = df_status['Status'].astype(str).str.upper().str.contains('CANCEL|DENEG|INUTIL', na=False)
-            
             return df_status.loc[mask_cancel, 'Chave'].tolist()
         return []
-        
-    except Exception as e:
-        st.warning(f"Aviso na leitura do Status: {e}. Prosseguindo sem filtro de cancelados.")
+    except Exception:
         return []
 
-# --- MÓDULO MATRIOSKA (XML RECURSIVO + ANTI-DUPLICIDADE) ---
+# --- MÓDULO MATRIOSKA ---
 def processar_arquivo_recursivo(arquivo_bytes, nome_arquivo, lista_dados, contadores, chaves_unicas):
-    # 1. Se for ZIP, abre e mergulha (Matrioska)
     if zipfile.is_zipfile(io.BytesIO(arquivo_bytes)):
         try:
             with zipfile.ZipFile(io.BytesIO(arquivo_bytes)) as z:
                 for nome_interno in z.namelist():
                     if nome_interno.endswith('/') or '__MACOSX' in nome_interno: continue
                     conteudo_interno = z.read(nome_interno)
-                    # Recursão passando o conjunto de chaves únicas
                     processar_arquivo_recursivo(conteudo_interno, nome_interno, lista_dados, contadores, chaves_unicas)
-        except Exception: 
-            pass 
-
-    # 2. Se não for ZIP, tenta ser XML
+        except Exception: pass 
     else:
         try:
             tree = ET.parse(io.BytesIO(arquivo_bytes))
             root = tree.getroot()
             ns_cte = {'cte': 'http://www.portalfiscal.inf.br/cte'}
             
-            # FILTRO 1: É CT-e?
             inf_cte = root.find('.//cte:infCte', ns_cte)
             if inf_cte is None:
                 contadores['ignorados'] += 1
                 return 
             
-            # FILTRO 2: Duplicidade
             chave = inf_cte.attrib.get('Id', '')[3:]
             if chave in chaves_unicas:
                 contadores['duplicados'] += 1
-                return # Já li essa nota antes, ignora!
+                return 
             
-            # Nota válida e única: processar
             chaves_unicas.add(chave)
             contadores['ctes'] += 1
             
-            # Extração de Dados
             cfop_tag = inf_cte.find('.//cte:ide/cte:CFOP', ns_cte)
             cfop = cfop_tag.text if cfop_tag is not None else "SEM_CFOP"
             
@@ -131,8 +109,7 @@ def processar_arquivo_recursivo(arquivo_bytes, nome_arquivo, lista_dados, contad
                 'Base Cálculo': bc_val,
                 'Crédito ICMS': icms_val
             })
-        except: 
-            pass
+        except: pass
 
 def processar_pacote_xml(uploaded_files, chaves_canceladas):
     dados_cte = []
@@ -148,14 +125,11 @@ def processar_pacote_xml(uploaded_files, chaves_canceladas):
     df_cte = pd.DataFrame(dados_cte)
     df_cte = clean_cfop_col(df_cte, 'CFOP')
     
-    # FILTRO 3: Status (Canceladas do Excel)
     ctes_cancelados = df_cte[df_cte['Chave'].isin(chaves_canceladas)]
     qtd_cancelados = len(ctes_cancelados)
     
-    # Mantém apenas os VÁLIDOS
     df_cte_validos = df_cte[~df_cte['Chave'].isin(chaves_canceladas)]
     
-    # Resumo por CFOP (Apenas Válidos)
     df_resumo_cfop = df_cte_validos.groupby('CFOP')[['Valor Contábil', 'Base Cálculo', 'Crédito ICMS']].sum().reset_index()
     df_resumo_cfop = df_resumo_cfop.sort_values('CFOP')
     
@@ -163,7 +137,7 @@ def processar_pacote_xml(uploaded_files, chaves_canceladas):
     
     return df_cte_validos, df_resumo_cfop, total_icms, contadores, qtd_cancelados
 
-# --- MÓDULO CSV (LIVRO P9) ---
+# --- MÓDULO CSV ---
 def gerar_livro_p9(df, tipo='entrada'):
     dff = df.copy()
     if tipo == 'entrada':
@@ -280,7 +254,6 @@ def main():
     
     st.markdown("---")
     
-    # Chaves dinâmicas
     k_ent = f"in_{st.session_state['id_auditoria']}"
     k_sai = f"out_{st.session_state['id_auditoria']}"
     k_xml = f"xml_{st.session_state['id_auditoria']}"
@@ -296,7 +269,6 @@ def main():
 
     if ent_f and sai_f:
         try:
-            # 1. Leitura
             cols_ent = ['NUM_NF', 'DATA_EMISSAO', 'CNPJ', 'UF', 'VLR_NF', 'AC', 'CFOP', 'COD_PROD', 'DESCR', 'NCM', 'UNID', 'VUNIT', 'QTDE', 'VPROD', 'DESC', 'FRETE', 'SEG', 'DESP', 'VC', 'CST-ICMS', 'BC-ICMS', 'VLR-ICMS', 'BC-ICMS-ST', 'ICMS-ST', 'VLR_IPI', 'CST_PIS', 'BC_PIS', 'VLR_PIS', 'CST_COF', 'BC_COF', 'VLR_COF']
             cols_sai = ['NF', 'DATA_EMISSAO', 'CNPJ', 'Ufp', 'VC', 'AC', 'CFOP', 'COD_ITEM', 'DESC_ITEM', 'NCM', 'UND', 'VUNIT', 'QTDE', 'VITEM', 'DESC', 'FRETE', 'SEG', 'OUTRAS', 'VC_ITEM', 'CST', 'BC_ICMS', 'ALIQ_ICMS', 'ICMS', 'BC_ICMSST', 'ICMSST', 'IPI', 'CST_PIS Escriturado', 'BC_PIS', 'PIS', 'CST_COF', 'BC_COF', 'COF']
 
@@ -311,7 +283,6 @@ def main():
             df_ent = clean_cfop_col(df_ent, 'CFOP')
             df_sai = clean_cfop_col(df_sai, 'CFOP')
 
-            # 2. Auditoria
             df_ent[['DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_CLIENTE_ERP', 'AÇÃO_DOMINIO']] = df_ent.apply(lambda r: auditoria_decisiva(r, 'entrada'), axis=1)
             df_sai[['DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_CLIENTE_ERP', 'AÇÃO_DOMINIO']] = df_sai.apply(lambda r: auditoria_decisiva(r, 'saida'), axis=1)
             
@@ -322,7 +293,6 @@ def main():
             v_st = df_sai['ICMSST'].sum() - df_ent['ICMS-ST'].sum()
             v_ipi = df_sai['IPI'].sum() - df_ent['VLR_IPI'].sum()
 
-            # 3. Processamento XML
             credito_cte = 0.0
             nfe_ign = 0
             n_dup = 0
@@ -339,14 +309,11 @@ def main():
                 nfe_ign = contadores['ignorados']
                 n_dup = contadores['duplicados']
 
-            # 4. Livros
             livro_ent = gerar_livro_p9(df_ent, 'entrada')
             livro_sai = gerar_livro_p9(df_sai, 'saida')
 
             st.success("Auditoria Concluída!")
 
-            # --- VISUALIZAÇÃO ---
-            
             st.subheader("💰 Apuração 1: Baseada nos Arquivos CSV (Domínio)")
             resumo_1 = pd.DataFrame([
                 {'Imposto': 'ICMS PRÓPRIO', 'Débitos': df_sai['ICMS'].sum(), 'Créditos': df_ent['VLR-ICMS'].sum(), 'Saldo': v_icms1, 'Situação': 'A RECOLHER' if v_icms1 > 0 else 'CREDOR'},
@@ -359,9 +326,8 @@ def main():
                 st.markdown("---")
                 st.subheader("🚚 Apuração 2: Considerando XML de Transporte")
                 
-                # Alertas de Filtro
                 cols_warn = st.columns(3)
-                if nfe_ign > 0: cols_warn[0].warning(f"⚠️ {nfe_ign} arquivos ignorados (não CT-e).")
+                if nfe_ign > 0: cols_warn[0].warning(f"⚠️ {nfe_ign} arquivos ignorados (não eram CT-e).")
                 if qtd_cancel > 0: cols_warn[1].error(f"🚫 {qtd_cancel} CT-es CANCELADOS excluídos.")
                 if n_dup > 0: cols_warn[2].info(f"ℹ️ {n_dup} duplicatas removidas.")
                 
@@ -399,18 +365,18 @@ def main():
             st.subheader("🚨 Inconsistências (Ação Necessária)")
             c1, c2 = st.columns(2)
             
+            erros_sai = df_sai[df_sai['DIAGNÓSTICO'] != "Regular"]
+            erros_ent = df_ent[df_ent['DIAGNÓSTICO'] != "Regular"]
+
             with c1:
                 st.markdown("**Saídas**")
-                erros_sai = df_sai[df_sai['DIAGNÓSTICO'] != "Regular"]
                 if erros_sai.empty: st.info("Ok")
                 else: st.dataframe(erros_sai[['NF', 'CFOP', 'DIAGNÓSTICO', 'AÇÃO_LEGAL', 'AÇÃO_CLIENTE_ERP', 'AÇÃO_DOMINIO']], use_container_width=True)
             with c2:
                 st.markdown("**Entradas**")
-                erros_ent = df_ent[df_ent['DIAGNÓSTICO'] != "Regular"]
                 if erros_ent.empty: st.info("Ok")
                 else: st.dataframe(erros_ent[['NUM_NF', 'CFOP', 'DIAGNÓSTICO', 'AÇÃO_DOMINIO', 'AÇÃO_LEGAL']], use_container_width=True)
 
-            # Exportação
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 df_ent.to_excel(writer, sheet_name='Entradas Auditadas', index=False)
@@ -424,25 +390,19 @@ def main():
                 
                 wb = writer.book
                 fmt_red = wb.add_format({'bg_color': '#FFC7CE'})
-                for sheet in ['Entradas Auditadas', 'Saídas Auditadas']:
-                    ws = writer.sheets[sheet]
+                
+                # CORREÇÃO CRÍTICA DO ERRO DE EXPORTAÇÃO
+                mapa_abas = {'Entradas Auditadas': df_ent, 'Saídas Auditadas': df_sai}
+                for nome_aba, df_dados in mapa_abas.items():
+                    ws = writer.sheets[nome_aba]
                     ws.set_column('A:Z', 22)
-                    for i, val in enumerate(df_ref['DIAGNÓSTICO']): # df_ref precisa ser pego do contexto certo
-                        pass # Correção: A lógica de pintura deve iterar sobre o dataframe correto ao salvar
-                
-                # Ajuste Fino na Pintura
-                ws_ent = writer.sheets['Entradas Auditadas']
-                for i, val in enumerate(df_ent['DIAGNÓSTICO']):
-                    if val != "Regular": ws_ent.set_row(i + 1, None, fmt_red)
-                
-                ws_sai = writer.sheets['Saídas Auditadas']
-                for i, val in enumerate(df_sai['DIAGNÓSTICO']):
-                    if val != "Regular": ws_sai.set_row(i + 1, None, fmt_red)
+                    for i, val in enumerate(df_dados['DIAGNÓSTICO']):
+                        if val != "Regular": ws.set_row(i + 1, None, fmt_red)
             
             st.download_button("📥 Baixar Relatório Completo", output.getvalue(), "Curador_Completo.xlsx")
 
         except Exception as e:
-            st.error(f"Erro Crítico (Verifique se há arquivos abertos ou caminhos de rede inacessíveis): {e}")
+            st.error(f"Erro Crítico: {e}")
 
 if __name__ == "__main__":
     main()
